@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from steam_api import get_new_releases
+from steam_api import filter_by_genre, get_new_releases
 
 load_dotenv()
 
@@ -33,22 +33,33 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             pass
-    return {"seen_ids": [], "chat_ids": []}
+    return {"seen_ids": [], "chat_ids": [], "filters": {}}
 
 
 def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
+def get_filter(state: dict, chat_id: int) -> str | None:
+    return state.get("filters", {}).get(str(chat_id))
+
+
 # ---------------------------------------------------------------------------
 # Message formatting
 # ---------------------------------------------------------------------------
 
-def format_releases(games: list[dict]) -> str:
+def format_releases(games: list[dict], genre_filter: str | None = None) -> str:
     if not games:
+        if genre_filter:
+            return f'No new "{genre_filter}" releases found right now.'
         return "No new releases found right now."
 
-    lines = ["🎮 New Steam Releases!\n"]
+    header = f"🎮 New Steam Releases"
+    if genre_filter:
+        header += f" — {genre_filter}"
+    header += "!\n"
+
+    lines = [header]
     for game in games:
         discount = game["discount_percent"]
         discount_str = f" (-{discount}%)" if discount else ""
@@ -81,21 +92,73 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Fetching Steam new releases...")
+    state = load_state()
+    chat_id = update.effective_chat.id
+    genre = get_filter(state, chat_id)
+
+    await update.message.reply_text(
+        f"Fetching Steam new releases{f' ({genre})' if genre else ''}..."
+    )
     try:
-        games = await get_new_releases()
-        await update.message.reply_text(format_releases(games[:10]))
+        games = await get_new_releases(with_genres=bool(genre))
+        if genre:
+            games = filter_by_genre(games, genre)
+        await update.message.reply_text(format_releases(games[:10], genre))
     except Exception as exc:
         logger.error("Error fetching releases: %s", exc)
         await update.message.reply_text("Could not fetch Steam data right now. Try again later.")
 
 
+async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    state = load_state()
+    args = context.args
+
+    # /filter with no args — show current filter
+    if not args:
+        current = get_filter(state, chat_id)
+        if current:
+            await update.message.reply_text(
+                f'Your current genre filter is: "{current}"\n\n'
+                "Use /filter clear to remove it, or /filter <genre> to change it.\n"
+                "Example genres: Action, RPG, Strategy, Indie, Adventure, Simulation, Sports"
+            )
+        else:
+            await update.message.reply_text(
+                "You have no genre filter set — you receive all new releases.\n\n"
+                "Set one with /filter <genre>\n"
+                "Example: /filter Action\n"
+                "Example genres: Action, RPG, Strategy, Indie, Adventure, Simulation, Sports"
+            )
+        return
+
+    genre = " ".join(args)
+
+    # /filter clear — remove filter
+    if genre.lower() == "clear":
+        state.setdefault("filters", {}).pop(str(chat_id), None)
+        save_state(state)
+        await update.message.reply_text("Genre filter cleared. You will now receive all new releases.")
+        return
+
+    # /filter <genre> — set filter
+    state.setdefault("filters", {})[str(chat_id)] = genre
+    save_state(state)
+    await update.message.reply_text(
+        f'Genre filter set to "{genre}".\n'
+        "/latest and daily notifications will now only show matching games."
+    )
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "Available commands:\n"
-        "/start   — Subscribe to daily new-release notifications\n"
-        "/latest  — Show current Steam new releases (top 10)\n"
-        "/help    — Show this help message"
+        "/start          — Subscribe to daily new-release notifications\n"
+        "/latest         — Show current Steam new releases (top 10)\n"
+        "/filter <genre> — Filter results by genre (e.g. Action, RPG, Indie)\n"
+        "/filter clear   — Remove your genre filter\n"
+        "/filter         — Show your current filter\n"
+        "/help           — Show this help message"
     )
     await update.message.reply_text(text)
 
@@ -110,8 +173,12 @@ async def daily_notify(app: Application) -> None:
         logger.info("No subscribers — skipping daily notify.")
         return
 
+    # Determine if any subscriber has a genre filter
+    filters = state.get("filters", {})
+    any_filter = any(str(cid) in filters for cid in state["chat_ids"])
+
     try:
-        games = await get_new_releases()
+        games = await get_new_releases(with_genres=any_filter)
     except Exception as exc:
         logger.error("Scheduler: failed to fetch releases: %s", exc)
         return
@@ -123,16 +190,26 @@ async def daily_notify(app: Application) -> None:
         logger.info("Scheduler: no new games to notify.")
         return
 
-    msg = format_releases(new_games[:10])
     for chat_id in state["chat_ids"]:
+        genre = filters.get(str(chat_id))
+        games_to_send = filter_by_genre(new_games, genre) if genre else new_games
+        if not games_to_send:
+            continue
         try:
-            await app.bot.send_message(chat_id=chat_id, text=msg)
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=format_releases(games_to_send[:10], genre),
+            )
         except Exception as exc:
             logger.warning("Could not send to %s: %s", chat_id, exc)
 
     state["seen_ids"] = list(seen | {g["id"] for g in new_games})
     save_state(state)
-    logger.info("Scheduler: notified %d chat(s) about %d new game(s).", len(state["chat_ids"]), len(new_games))
+    logger.info(
+        "Scheduler: notified %d chat(s) about %d new game(s).",
+        len(state["chat_ids"]),
+        len(new_games),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +237,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("latest", cmd_latest))
+    app.add_handler(CommandHandler("filter", cmd_filter))
     app.add_handler(CommandHandler("help", cmd_help))
 
     app.run_polling(drop_pending_updates=True)
