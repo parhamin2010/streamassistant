@@ -143,22 +143,24 @@ def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set. Copy .env.example to .env and fill it in.")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    scheduler = AsyncIOScheduler()
+
+    async def post_init(app: Application) -> None:
+        scheduler.add_job(
+            daily_notify,
+            trigger="cron",
+            hour=NOTIFY_HOUR,
+            minute=0,
+            kwargs={"app": app},
+        )
+        scheduler.start()
+        logger.info("Scheduler started — daily notify at %02d:00.", NOTIFY_HOUR)
+
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("help", cmd_help))
-
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        daily_notify,
-        trigger="cron",
-        hour=NOTIFY_HOUR,
-        minute=0,
-        kwargs={"app": app},
-    )
-    scheduler.start()
-    logger.info("Scheduler started — daily notify at %02d:00.", NOTIFY_HOUR)
 
     app.run_polling(drop_pending_updates=True)
 
