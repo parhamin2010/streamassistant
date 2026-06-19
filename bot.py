@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from steam_api import filter_by_genre, get_new_releases
+from steam_api import filter_by_genre, get_new_releases, get_trending
 
 load_dotenv()
 
@@ -109,6 +109,34 @@ async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Could not fetch Steam data right now. Try again later.")
 
 
+async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = load_state()
+    chat_id = update.effective_chat.id
+    genre = get_filter(state, chat_id)
+
+    await update.message.reply_text(
+        f"Fetching trending Steam games{f' ({genre})' if genre else ''}..."
+    )
+    try:
+        games = await get_trending(with_genres=bool(genre))
+        if genre:
+            games = filter_by_genre(games, genre)
+        header = "🔥 Trending on Steam"
+        if genre:
+            header += f" — {genre}"
+        header += "!\n"
+        lines = [header]
+        for i, game in enumerate(games[:10], start=1):
+            discount = game["discount_percent"]
+            discount_str = f" (-{discount}%)" if discount else ""
+            lines.append(f"{i}. {game['name']} — {game['price_usd']}{discount_str}")
+            lines.append(f"   🔗 {game['url']}\n")
+        await update.message.reply_text("\n".join(lines) if len(lines) > 1 else f'No trending "{genre}" games found right now.')
+    except Exception as exc:
+        logger.error("Error fetching trending: %s", exc)
+        await update.message.reply_text("Could not fetch Steam data right now. Try again later.")
+
+
 async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     state = load_state()
@@ -155,6 +183,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Available commands:\n"
         "/start          — Subscribe to daily new-release notifications\n"
         "/latest         — Show current Steam new releases (top 10)\n"
+        "/trending       — Show current Steam top sellers (top 10)\n"
         "/filter <genre> — Filter results by genre (e.g. Action, RPG, Indie)\n"
         "/filter clear   — Remove your genre filter\n"
         "/filter         — Show your current filter\n"
@@ -237,6 +266,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("latest", cmd_latest))
+    app.add_handler(CommandHandler("trending", cmd_trending))
     app.add_handler(CommandHandler("filter", cmd_filter))
     app.add_handler(CommandHandler("help", cmd_help))
 
